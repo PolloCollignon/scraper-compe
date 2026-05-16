@@ -10,33 +10,36 @@ print("Scraper de competencia iniciado.")
 
 # -------------------------------------------------------
 # CONFIGURACIÓN DE TIENDAS
-# Agrega o quita tiendas aquí sin tocar el resto del código
+# platform:  shopify
+# inventory: "inventory_json"      → data-product-inventory-json (lebump style)
+#            "data_attribute"      → data-inventoryQuantity en el HTML (labarriguita)
+#            "variant_available"   → solo available:true/false en el JSON (las demás)
 # -------------------------------------------------------
 STORES = [
     {
         "name": "mumpreggo",
         "base_url": "https://mumpreggo.com",
-        "platform": "shopify",   # shopify | woocommerce | unknown
+        "inventory": "variant_available",
     },
     {
         "name": "hellomom",
         "base_url": "https://hellomom.com.mx",
-        "platform": "shopify",
+        "inventory": "variant_available",
     },
     {
         "name": "hellomom_lomas",
         "base_url": "https://hellomom-gdllomasaltas.com.mx",
-        "platform": "shopify",
+        "inventory": "variant_available",
     },
     {
         "name": "moman",
         "base_url": "https://moman.mx",
-        "platform": "shopify",
+        "inventory": "variant_available",
     },
     {
         "name": "labarriguita",
         "base_url": "https://labarriguitademama.com",
-        "platform": "shopify",
+        "inventory": "data_attribute",
     },
 ]
 
@@ -51,49 +54,45 @@ HEADERS = {
 
 DB_FILE = "inventario_competencia.db"
 
+
 # -------------------------------------------------------
 # BASE DE DATOS
 # -------------------------------------------------------
-def save_to_db(df: pd.DataFrame):
-    """Guarda el DataFrame en SQLite, acumulando registros históricos."""
-    conn = sqlite3.connect(DB_FILE)
-    df.to_sql("inventario", conn, if_exists="append", index=False)
-    conn.close()
-    print(f"  💾 {len(df)} filas guardadas en {DB_FILE}")
-
-
 def init_db():
-    """Crea la tabla si no existe (útil en primera ejecución)."""
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventario (
-            tienda          TEXT,
-            product_url     TEXT,
-            product_name    TEXT,
-            variant_id      TEXT,
-            variant_title   TEXT,
-            sku             TEXT,
-            price           TEXT,
-            inventory_quantity INTEGER,
-            available       INTEGER,
-            timestamp       TEXT
+            tienda              TEXT,
+            product_url         TEXT,
+            product_name        TEXT,
+            variant_id          TEXT,
+            variant_title       TEXT,
+            sku                 TEXT,
+            price               TEXT,
+            inventory_quantity  INTEGER,
+            available           INTEGER,
+            timestamp           TEXT
         )
     """)
     conn.commit()
     conn.close()
 
 
+def save_to_db(df: pd.DataFrame):
+    conn = sqlite3.connect(DB_FILE)
+    df.to_sql("inventario", conn, if_exists="append", index=False)
+    conn.close()
+    print(f"  💾 {len(df)} filas guardadas en {DB_FILE}")
+
+
 # -------------------------------------------------------
-# SHOPIFY — obtener todos los productos via /products.json
+# OBTENER TODOS LOS PRODUCTOS (igual en todas las tiendas)
 # -------------------------------------------------------
-def shopify_get_all_products(base_url: str) -> list:
-    """Descarga todos los productos usando el endpoint público de Shopify."""
+def get_all_products(base_url: str) -> list:
     all_products = []
     page = 1
-    limit = 250
-
     while True:
-        url = f"{base_url}/products.json?page={page}&limit={limit}"
+        url = f"{base_url}/products.json?page={page}&limit=250"
         try:
             resp = requests.get(url, headers=HEADERS, timeout=15)
         except requests.RequestException as e:
@@ -104,8 +103,7 @@ def shopify_get_all_products(base_url: str) -> list:
             print(f"    ⚠️  HTTP {resp.status_code} en {url}")
             break
 
-        data = resp.json()
-        products = data.get("products", [])
+        products = resp.json().get("products", [])
         if not products:
             break
 
@@ -117,88 +115,176 @@ def shopify_get_all_products(base_url: str) -> list:
     return all_products
 
 
-def shopify_extract_inventory(base_url: str, product: dict) -> list:
-    """
-    Extrae inventario de una página de producto Shopify.
-    Intenta dos métodos:
-      1. Script tag 'data-product-inventory-json'  (igual que tu scraper de lebump)
-      2. Variantes directas desde /products/<handle>.json
-    """
-    handle = product.get("handle", "")
+# -------------------------------------------------------
+# MÉTODO A: data-product-inventory-json  (lebump style)
+# Devuelve inventory_quantity real
+# -------------------------------------------------------
+def extract_inventory_json(base_url: str, product: dict) -> list:
+    handle = product["handle"]
     product_url = f"{base_url}/products/{handle}"
     rows = []
 
-    # --- Método 1: JSON de inventario en el HTML ---
     try:
         resp = requests.get(product_url, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            script_tag = soup.find(
-                "script",
-                {"type": "application/json", "data-product-inventory-json": True},
-            )
-            if script_tag:
-                inv_data = json.loads(script_tag.string)
-                for variant_id, val in inv_data.get("inventory", {}).items():
-                    rows.append({
-                        "product_url": product_url,
-                        "product_name": handle,
-                        "variant_id": variant_id,
-                        "variant_title": "",
-                        "sku": "",
-                        "price": "",
-                        "inventory_quantity": val.get("inventory_quantity", 0),
-                        "available": int(val.get("inventory_quantity", 0) > 0),
-                    })
-                if rows:
-                    return rows
-    except Exception as e:
-        print(f"      ⚠️  Método 1 falló para {handle}: {e}")
+        if resp.status_code != 200:
+            return rows
 
-    # --- Método 2: variantes del producto desde /products/<handle>.json ---
-    try:
-        json_url = f"{base_url}/products/{handle}.json"
-        resp2 = requests.get(json_url, headers=HEADERS, timeout=15)
-        if resp2.status_code == 200:
-            p = resp2.json().get("product", {})
-            for v in p.get("variants", []):
-                rows.append({
-                    "product_url": product_url,
-                    "product_name": handle,
-                    "variant_id": str(v.get("id", "")),
-                    "variant_title": v.get("title", ""),
-                    "sku": v.get("sku", ""),
-                    "price": v.get("price", ""),
-                    "inventory_quantity": v.get("inventory_quantity", 0),
-                    "available": int(v.get("available", False)),
-                })
+        soup = BeautifulSoup(resp.text, "html.parser")
+        script_tag = soup.find(
+            "script",
+            {"type": "application/json", "data-product-inventory-json": True},
+        )
+        if not script_tag:
+            return rows
+
+        inv_data = json.loads(script_tag.string)
+        for variant_id, val in inv_data.get("inventory", {}).items():
+            qty = val.get("inventory_quantity", 0)
+            rows.append({
+                "variant_id": variant_id,
+                "variant_title": "",
+                "sku": "",
+                "price": "",
+                "inventory_quantity": qty,
+                "available": int(qty > 0),
+            })
     except Exception as e:
-        print(f"      ⚠️  Método 2 falló para {handle}: {e}")
+        print(f"      ⚠️  extract_inventory_json falló ({handle}): {e}")
 
     return rows
 
 
-def scrape_shopify(store: dict) -> pd.DataFrame:
-    """Scraper completo para una tienda Shopify."""
+# -------------------------------------------------------
+# MÉTODO B: data-inventoryQuantity en el HTML (labarriguita)
+# Devuelve inventory_quantity real
+# -------------------------------------------------------
+def extract_data_attribute(base_url: str, product: dict) -> list:
+    handle = product["handle"]
+    product_url = f"{base_url}/products/{handle}"
+    rows = []
+
+    try:
+        resp = requests.get(product_url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return rows
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Buscar elementos con data-inventoryquantity
+        elements = soup.find_all(attrs={"data-inventoryquantity": True})
+
+        if elements:
+            for el in elements:
+                qty = int(el.get("data-inventoryquantity", 0) or 0)
+                variant_id = el.get("data-variant-id", el.get("data-id", ""))
+                variant_title = el.get("data-variant-title", el.get("data-title", ""))
+                rows.append({
+                    "variant_id": str(variant_id),
+                    "variant_title": variant_title,
+                    "sku": el.get("data-sku", ""),
+                    "price": el.get("data-price", ""),
+                    "inventory_quantity": qty,
+                    "available": int(qty > 0),
+                })
+        else:
+            # Fallback: buscar en scripts JSON que contengan inventoryQuantity
+            for script in soup.find_all("script"):
+                if script.string and "inventoryQuantity" in script.string:
+                    try:
+                        text = script.string.strip()
+                        start = text.find("{")
+                        end = text.rfind("}") + 1
+                        if start != -1:
+                            data = json.loads(text[start:end])
+                            variants = data.get("variants", [])
+                            for v in variants:
+                                qty = v.get("inventoryQuantity", v.get("inventory_quantity", 0))
+                                rows.append({
+                                    "variant_id": str(v.get("id", "")),
+                                    "variant_title": v.get("title", ""),
+                                    "sku": v.get("sku", ""),
+                                    "price": str(v.get("price", "")),
+                                    "inventory_quantity": qty,
+                                    "available": int(qty > 0),
+                                })
+                            if rows:
+                                break
+                    except Exception:
+                        continue
+
+    except Exception as e:
+        print(f"      ⚠️  extract_data_attribute falló ({handle}): {e}")
+
+    return rows
+
+
+# -------------------------------------------------------
+# MÉTODO C: available true/false desde /products.json
+# No da cantidad exacta, solo disponible (1) o no (0)
+# -------------------------------------------------------
+def extract_variant_available(product: dict, base_url: str) -> list:
+    handle = product["handle"]
+    rows = []
+
+    try:
+        for v in product.get("variants", []):
+            available = v.get("available", False)
+            rows.append({
+                "variant_id": str(v.get("id", "")),
+                "variant_title": v.get("title", ""),
+                "sku": v.get("sku", ""),
+                "price": str(v.get("price", "")),
+                "inventory_quantity": None,  # No expuesto por Shopify en este método
+                "available": int(available),
+            })
+    except Exception as e:
+        print(f"      ⚠️  extract_variant_available falló ({handle}): {e}")
+
+    return rows
+
+
+# -------------------------------------------------------
+# SCRAPER PRINCIPAL POR TIENDA
+# -------------------------------------------------------
+def scrape_store(store: dict) -> pd.DataFrame:
     name = store["name"]
     base_url = store["base_url"]
-    print(f"\n🛍️  [{name}] Obteniendo productos Shopify de {base_url}")
+    method = store["inventory"]
 
-    products = shopify_get_all_products(base_url)
+    print(f"\n🛍️  [{name}] {base_url}  |  método: {method}")
+
+    products = get_all_products(base_url)
     print(f"  Total productos: {len(products)}")
 
     if not products:
-        print(f"  ⛔ Sin productos — verifica que {base_url} sea Shopify")
+        print(f"  ⛔ Sin productos")
         return pd.DataFrame()
 
     all_rows = []
     for i, product in enumerate(products):
-        print(f"  [{i+1}/{len(products)}] {product.get('handle', '')}")
-        rows = shopify_extract_inventory(base_url, product)
+        handle = product.get("handle", "")
+        print(f"  [{i+1}/{len(products)}] {handle}")
+
+        if method == "inventory_json":
+            rows = extract_inventory_json(base_url, product)
+        elif method == "data_attribute":
+            rows = extract_data_attribute(base_url, product)
+        elif method == "variant_available":
+            # Ya tenemos los datos del products.json, sin petición extra
+            rows = extract_variant_available(product, base_url)
+        else:
+            rows = []
+
         for r in rows:
             r["tienda"] = name
+            r["product_url"] = f"{base_url}/products/{handle}"
+            r["product_name"] = handle
+
         all_rows.extend(rows)
-        time.sleep(0.5)
+
+        # Solo pausar si hicimos una petición HTTP extra al producto
+        if method in ("inventory_json", "data_attribute"):
+            time.sleep(0.5)
 
     df = pd.DataFrame(all_rows)
     df["timestamp"] = datetime.now().isoformat()
@@ -206,59 +292,16 @@ def scrape_shopify(store: dict) -> pd.DataFrame:
 
 
 # -------------------------------------------------------
-# DETECCIÓN AUTOMÁTICA DE PLATAFORMA
-# (útil si no estás seguro de que el sitio es Shopify)
-# -------------------------------------------------------
-def detect_platform(base_url: str) -> str:
-    """Detecta si el sitio es Shopify, WooCommerce u otro."""
-    try:
-        resp = requests.get(base_url, headers=HEADERS, timeout=15)
-        html = resp.text.lower()
-
-        if "shopify" in html or "cdn.shopify" in html:
-            return "shopify"
-        if "woocommerce" in html or "wp-content" in html:
-            return "woocommerce"
-
-        # Probar endpoint Shopify directamente
-        r2 = requests.get(
-            f"{base_url}/products.json?limit=1", headers=HEADERS, timeout=10
-        )
-        if r2.status_code == 200:
-            d = r2.json()
-            if "products" in d:
-                return "shopify"
-    except Exception:
-        pass
-
-    return "unknown"
-
-
-# -------------------------------------------------------
-# FUNCIÓN PRINCIPAL
+# MAIN
 # -------------------------------------------------------
 def main():
     init_db()
     all_dfs = []
 
     for store in STORES:
-        platform = store.get("platform", "unknown")
-
-        # Si no se especificó plataforma, detectar automáticamente
-        if platform == "unknown":
-            print(f"\n🔍 Detectando plataforma de {store['base_url']}...")
-            platform = detect_platform(store["base_url"])
-            print(f"  → {platform}")
-
-        if platform == "shopify":
-            df = scrape_shopify(store)
-            if not df.empty:
-                all_dfs.append(df)
-        else:
-            print(
-                f"\n⚠️  [{store['name']}] Plataforma '{platform}' no soportada aún. "
-                "Cambia 'platform' en STORES o implementa el scraper correspondiente."
-            )
+        df = scrape_store(store)
+        if not df.empty:
+            all_dfs.append(df)
 
     if all_dfs:
         df_final = pd.concat(all_dfs, ignore_index=True)
